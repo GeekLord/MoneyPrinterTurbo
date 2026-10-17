@@ -91,8 +91,8 @@ style_file = Path(__file__).with_name("styles.css")
 streamlit_style = f"<style>{style_file.read_text(encoding='utf-8')}</style>"
 st.markdown(streamlit_style, unsafe_allow_html=True)
 # 定义资源目录
-font_dir = os.path.join(root_dir, "resource", "fonts")
-song_dir = os.path.join(root_dir, "resource", "songs")
+font_dir = utils.font_dir()
+song_dir = utils.song_dir()
 i18n_dir = os.path.join(root_dir, "webui", "i18n")
 config_file = os.path.join(root_dir, "webui", ".streamlit", "webui.toml")
 # 语言列表必须在会话状态初始化前可用，首次访问时才能把浏览器 locale 映射到
@@ -204,16 +204,7 @@ DEFAULT_SUBTITLE_SETTINGS = {
     "subtitle_background_color": "#000000",
     "rounded_subtitle_background": False,
 }
-LOCAL_MATERIAL_EXTENSIONS = {
-    ".mp4",
-    ".mov",
-    ".avi",
-    ".flv",
-    ".mkv",
-    ".jpg",
-    ".jpeg",
-    ".png",
-}
+LOCAL_MATERIAL_EXTENSIONS = set(material_upload_service.SUPPORTED_MATERIAL_EXTENSIONS)
 CUSTOM_AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
 _FINAL_VIDEO_PATTERN = re.compile(
     r"^final-(?P<index>\d+)\.(?P<extension>mp4|mov|mkv|webm)$",
@@ -839,7 +830,7 @@ def _find_final_task_video(task_path: str) -> str:
     candidates = []
     for file_name in files:
         match = _FINAL_VIDEO_PATTERN.fullmatch(file_name)
-        if match:
+        if match and os.path.isfile(os.path.join(task_path, file_name)):
             candidates.append((int(match.group("index")), file_name))
 
     if not candidates:
@@ -1216,10 +1207,12 @@ def _delete_task(task_id, task_path, task_state=None):
         return False
 
     try:
-        if hasattr(sm.state, "delete_task"):
-            sm.state.delete_task(task_id)
         if os.path.isdir(normalized_path):
             shutil.rmtree(normalized_path)
+        # Keep the persisted task available for retry when file removal fails
+        # (for example, a video is still locked by another process on Windows).
+        if hasattr(sm.state, "delete_task"):
+            sm.state.delete_task(task_id)
         logger.info(f"deleted task: {task_id}")
         return True
     except Exception as e:
@@ -1876,7 +1869,9 @@ def get_all_fonts():
     for root, dirs, files in os.walk(font_dir):
         for file in files:
             if file.endswith(".ttf") or file.endswith(".ttc"):
-                fonts.append(file)
+                # Keep each option tied to its file, including nested fonts.
+                relative_path = os.path.relpath(os.path.join(root, file), font_dir)
+                fonts.append(relative_path.replace(os.sep, "/"))
     fonts.sort()
     return fonts
 
@@ -1899,7 +1894,7 @@ def open_task_folder(task_id):
         # 通过路径拼接访问任务目录之外的位置，也避免后续打开目录时触发
         # 平台 shell 对特殊字符的解释。
         normalized_task_id = str(UUID(str(task_id)))
-        tasks_root = os.path.abspath(os.path.join(root_dir, "storage", "tasks"))
+        tasks_root = os.path.abspath(utils.task_dir())
         path = os.path.abspath(os.path.join(tasks_root, normalized_task_id))
 
         # 即使 UUID 校验通过，也再次确认最终路径仍在任务根目录内，避免
@@ -2030,20 +2025,21 @@ def _render_generation_task_snapshot(task_id, task):
         _render_generation_logs(task_id)
         return
 
+    video_files = task.get("videos") or []
     if state == const.TASK_STATE_FAILED:
         error = str(task.get("error") or "").strip()
         message = tr("Video Generation Failed")
         st.error(f"{message}: {error}" if error else message)
-        _render_generation_logs(task_id)
-        return
-
-    video_files = task.get("videos") or []
-    if state != const.TASK_STATE_COMPLETE or not video_files:
+        if not video_files:
+            _render_generation_logs(task_id)
+            return
+    elif state != const.TASK_STATE_COMPLETE or not video_files:
         st.error(tr("Video Generation Failed"))
         _render_generation_logs(task_id)
         return
 
-    st.success(tr("Video Generation Completed"))
+    if state == const.TASK_STATE_COMPLETE:
+        st.success(tr("Video Generation Completed"))
     for warning in task.get("warnings") or []:
         if isinstance(warning, Mapping) and warning.get("code") == "batch_materials_reused":
             st.warning(
@@ -2116,7 +2112,10 @@ def _render_generation_task_snapshot(task_id, task):
         )
 
     _render_generation_logs(task_id)
-    if st.session_state.get("handled_generation_task_id") != task_id:
+    if (
+        state == const.TASK_STATE_COMPLETE
+        and st.session_state.get("handled_generation_task_id") != task_id
+    ):
         # Fragment 可能重复渲染同一个完成任务。无论是否开启自动打开目录，
         # 每个任务都只处理一次完成事件，避免重复弹出资源管理器或重复写入日志。
         st.session_state["handled_generation_task_id"] = task_id
@@ -3580,6 +3579,16 @@ def _render_settings_dialog():
                         field.default_value,
                     ),
                 )
+
+            if llm_provider == "kimi_code" and middle_config_panel.open:
+                from app.services import kimi_code_oauth
+                from webui.kimi_login import render_kimi_login
+
+                # 给嵌套 fragment 独立的容器，轮询重绘不占用后续控件的位置。
+                with llm_form_panel.container():
+                    render_kimi_login(
+                        kimi_code_oauth.resolve_region(st_llm_base_url), tr
+                    )
 
             if llm_form_panel.button(
                 tr("Test LLM Connection"),
